@@ -1,15 +1,24 @@
 """Tkinter GUI for the chat client: login screen and main chat window."""
 
-import base64
 import os
 import queue
+import subprocess
+import sys
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from network import DemoConnection, TCPConnection, encode_file
+from network import DemoConnection, TCPConnection
 
 POLL_MS = 50  # how often the GUI checks for incoming network events
+
+# Opening one of these runs it, so a received file gets a warning first
+RUNNABLE_TYPES = {".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".pif", ".lnk", ".reg", ".ps1", ".vbs",
+                  ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".cpl", ".jar", ".py", ".pyw", ".sh"}
+
+FILE_ICONS = {"🖼": (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg"),
+              "🎞": (".mp4", ".mov", ".avi", ".mkv", ".webm", ".mp3", ".wav"),
+              "📦": (".zip", ".rar", ".7z", ".tar", ".gz")}
 
 COLORS = {
     "bg": "#1e1f22",
@@ -26,7 +35,7 @@ COLORS = {
 
 
 class ChatApp(tk.Tk):
-    def __init__(self, host="127.0.0.1", port=5000, demo=False):
+    def __init__(self, host="127.0.0.1", port=5000, demo=False, download_dir="downloads"):
         super().__init__()
         self.title("Chatapp")
         self.geometry("900x600")
@@ -35,6 +44,7 @@ class ChatApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.demo = demo
+        self.download_dir = download_dir
         self.inbox = queue.Queue()
         self.conn = None
         self.username = None
@@ -61,13 +71,16 @@ class ChatApp(tk.Tk):
                         insertcolor=COLORS["text"], borderwidth=0, padding=6)
         style.configure("TCheckbutton", background=COLORS["sidebar"], foreground=COLORS["text"])
         style.map("TCheckbutton", background=[("active", COLORS["sidebar"])])
+        style.configure("Transfer.Horizontal.TProgressbar", background=COLORS["accent"],
+                        troughcolor=COLORS["bg"], borderwidth=0)
 
     # ---------- connection lifecycle ----------
 
     def start_login(self, host, port, username, password, demo):
         self.username = username
         self._pending_login = {"type": "login", "username": username, "password": password}
-        self.conn = DemoConnection(self.inbox) if demo else TCPConnection(self.inbox)
+        connection = DemoConnection if demo else TCPConnection
+        self.conn = connection(self.inbox, self.download_dir)
         self.conn.connect(host, port)
 
     def _poll(self):
@@ -115,6 +128,14 @@ class ChatApp(tk.Tk):
     def send(self, msg):
         if self.conn:
             self.conn.send(msg)
+
+    def offer_file(self, path, to):
+        if self.conn:
+            self.conn.offer_file(path, to)
+
+    def request_file(self, offer):
+        if self.conn:
+            self.conn.request_file(offer)
 
     def logout(self):
         self._drop_connection()
@@ -200,7 +221,10 @@ class ChatFrame(ttk.Frame):
         self.channels = [f"#{c.lstrip('#')}" for c in channels]
         self.users = []
         self.current = self.channels[0] if self.channels else None
-        self._file_links = {}  # Text tag -> file event, for click-to-save
+        self.cards = {}  # offer_id -> the offer, plus "state" and "path" (see _card_action)
+        self.card_widgets = {}  # offer_id -> widgets of its card, if it's on screen
+        self.transfer_rows = {}  # file_id -> widgets of its progress row
+        self._finished_transfers = set()  # file_ids that must not get a new row
 
         self._build_sidebar()
         self._build_chat_area()
@@ -250,7 +274,9 @@ class ChatFrame(ttk.Frame):
 
         body = tk.Frame(main, bg=COLORS["panel"])
         body.pack(fill="both", expand=True)
-        self.display = tk.Text(body, bg=COLORS["panel"], fg=COLORS["text"], wrap="word",
+        # height=1 just means "ask for little": it still expands to fill the window,
+        # but no longer pushes the progress rows and input bar off the bottom.
+        self.display = tk.Text(body, bg=COLORS["panel"], fg=COLORS["text"], wrap="word", height=1,
                                borderwidth=0, highlightthickness=0, padx=16, pady=10,
                                font=("Segoe UI", 11), state="disabled", cursor="arrow")
         scroll = ttk.Scrollbar(body, command=self.display.yview)
@@ -263,10 +289,13 @@ class ChatFrame(ttk.Frame):
         self.display.tag_configure("other", foreground=COLORS["other"], font=("Segoe UI", 11, "bold"))
         self.display.tag_configure("system", foreground=COLORS["system"], font=("Segoe UI", 10, "italic"))
         self.display.tag_configure("error", foreground=COLORS["error"], font=("Segoe UI", 10, "italic"))
-        self.display.tag_configure("file", foreground=COLORS["accent"], underline=True)
+
+        # Packed only while a transfer is running (see _update_transfer)
+        self.transfer_panel = tk.Frame(main, bg=COLORS["panel"])
 
         bar = tk.Frame(main, bg=COLORS["panel"])
         bar.pack(fill="x", padx=16, pady=(0, 16))
+        self.input_bar = bar
         inner = tk.Frame(bar, bg="#383a40")
         inner.pack(fill="x")
 
@@ -329,29 +358,39 @@ class ChatFrame(ttk.Frame):
 
     def handle_event(self, ev):
         kind = ev.get("type")
-        if kind in ("message", "file"):
-            key = self._conversation_key(ev)
-            self.history.setdefault(key, []).append(ev)
-            if key.startswith("#") and key not in self.channels:
-                self.channels.append(key)
-            if key.startswith("@") and key not in self.users:
-                self.users.append(key)
-            if key == self.current:
-                self._append(ev)
-            else:
-                self.unread[key] = self.unread.get(key, 0) + 1
-            self._refresh_sidebar()
+        if kind == "message":
+            self._add_to_conversation(self._conversation_key(ev), ev)
         elif kind == "users":
             self.set_users(ev.get("users", []))
         elif kind == "error":
             self.system_message(ev.get("reason", "Server error."), error=True)
+        elif kind == "file_offer":
+            self._add_card(ev)
+        elif kind == "_file_progress":
+            self._update_transfer(ev)
+        elif kind in ("_file_done", "_file_failed"):
+            self._finish_transfer(ev)
+
+    def _add_to_conversation(self, key, ev):
+        self.history.setdefault(key, []).append(ev)
+        if key.startswith("#") and key not in self.channels:
+            self.channels.append(key)
+        if key.startswith("@") and key not in self.users:
+            self.users.append(key)
+        if key == self.current:
+            self._append(ev)
+        else:
+            self.unread[key] = self.unread.get(key, 0) + 1
+        self._refresh_sidebar()
 
     def _render_current(self):
         self.header.configure(text=self._title(self.current) if self.current else "No conversation selected")
         self.display.configure(state="normal")
         self.display.delete("1.0", "end")
         self.display.configure(state="disabled")
-        self._file_links.clear()
+        for widgets in self.card_widgets.values():
+            widgets["frame"].destroy()
+        self.card_widgets.clear()
         for ev in self.history.get(self.current, []):
             self._append(ev)
 
@@ -368,15 +407,11 @@ class ChatFrame(ttk.Frame):
             stamp = time.strftime("%H:%M", time.localtime(ev.get("ts") or time.time()))
             d.insert("end", f"{stamp}  ", "time")
             d.insert("end", sender, "me" if sender == self.username else "other")
-            if ev.get("type") == "file":
-                tag = f"file{len(self._file_links)}"
-                self._file_links[tag] = ev
-                d.insert("end", "  sent a file: ")
-                d.insert("end", f"📎 {ev.get('filename', 'file')} ({_human_size(ev.get('size', 0))})", ("file", tag))
-                d.tag_bind(tag, "<Button-1>", lambda _e, t=tag: self.save_file(self._file_links[t]))
-                d.tag_bind(tag, "<Enter>", lambda _e: d.configure(cursor="hand2"))
-                d.tag_bind(tag, "<Leave>", lambda _e: d.configure(cursor="arrow"))
+            if ev.get("type") == "file_offer":
                 d.insert("end", "\n")
+                d.window_create("end", window=self._make_card(ev["offer_id"]), pady=4)
+                d.insert("end", "\n")
+                d.update_idletasks()  # the card needs a height before see("end") can scroll past it
             else:
                 d.insert("end", f"\n{ev.get('text', '')}\n")
         d.insert("end", "\n")
@@ -411,23 +446,167 @@ class ChatFrame(ttk.Frame):
         if not path:
             return
         try:
-            filename, size, data = encode_file(path)
+            self.app.offer_file(path, self.current)
         except (OSError, ValueError) as e:
             messagebox.showerror("Can't send file", str(e))
-            return
-        self.app.send({"type": "file", "to": self.current, "filename": filename, "size": size, "data": data})
 
-    def save_file(self, ev):
-        path = filedialog.asksaveasfilename(title="Save file", initialfile=ev.get("filename", "file"))
-        if not path:
+    # ---------- file cards ----------
+
+    def _add_card(self, ev):
+        mine = ev.get("sender") == self.username
+        self.cards[ev["offer_id"]] = dict(ev, state="saved" if mine else "available")
+        self._add_to_conversation(self._conversation_key(ev), ev)
+
+    def _make_card(self, offer_id):
+        """A file's preview in the chat. Clicking it downloads or opens the file."""
+        card = self.cards[offer_id]
+        name = card.get("filename", "file")
+        bg = COLORS["sidebar"]
+        frame = tk.Frame(self.display, bg=bg, padx=12, pady=8, cursor="hand2")
+        icon = tk.Label(frame, text=_file_icon(name), bg=bg, fg=COLORS["text"], font=("Segoe UI Emoji", 20))
+        icon.grid(row=0, column=0, rowspan=3, padx=(0, 10))
+        title = tk.Label(frame, text=name, bg=bg, fg="white", font=("Segoe UI", 11, "bold"), anchor="w")
+        title.grid(row=0, column=1, sticky="w")
+        kind = os.path.splitext(name)[1].lstrip(".").upper() or "FILE"
+        meta = tk.Label(frame, text=f"{kind}  ·  {_human_size(card.get('size', 0))}", bg=bg,
+                        fg=COLORS["muted"], font=("Segoe UI", 9), anchor="w")
+        meta.grid(row=1, column=1, sticky="w")
+        action = tk.Label(frame, bg=bg, font=("Segoe UI", 9, "bold"), anchor="w")
+        action.grid(row=2, column=1, sticky="w")
+        for widget in (frame, icon, title, meta, action):
+            widget.bind("<Button-1>", lambda _e: self._on_card_click(offer_id))
+        self.card_widgets[offer_id] = {"frame": frame, "action": action}
+        self._refresh_card(offer_id)
+        return frame
+
+    def _card_action(self, card):
+        """What a card offers in each state, as (text, color)."""
+        return {"available": ("Click to download", COLORS["accent"]),
+                "downloading": ("Downloading...", COLORS["muted"]),
+                "saved": ("Click to open", COLORS["me"]),
+                "failed": ("Download failed. Click to try again", COLORS["error"])}[card["state"]]
+
+    def _refresh_card(self, offer_id):
+        widgets = self.card_widgets.get(offer_id)
+        if widgets:
+            text, color = self._card_action(self.cards[offer_id])
+            widgets["action"].configure(text=text, fg=color)
+
+    def _set_card_state(self, offer_id, state, path=None):
+        card = self.cards.get(offer_id)
+        if card:
+            card["state"] = state
+            card["path"] = path or card.get("path")
+            self._refresh_card(offer_id)
+
+    def _on_card_click(self, offer_id):
+        card = self.cards[offer_id]
+        if card["state"] == "saved":
+            self._open_file(card)
+        elif card["state"] in ("available", "failed"):
+            self._set_card_state(offer_id, "downloading")
+            self.app.request_file(card)
+
+    def _open_file(self, card):
+        path = card.get("path")
+        mine = card.get("sender") == self.username
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Can't open file", f"{card.get('filename')} is no longer at:\n{path}")
             return
+        if not mine and os.path.splitext(path)[1].lower() in RUNNABLE_TYPES:
+            if not messagebox.askyesno("Open this file?",
+                                       f"{os.path.basename(path)} is a program or script from "
+                                       f"{card.get('sender')}. Opening it will run it on your computer.\n\n"
+                                       "Only continue if you trust this file. Open it?",
+                                       icon="warning", default="no"):
+                return
         try:
-            with open(path, "wb") as f:
-                f.write(base64.b64decode(ev.get("data", "")))
-        except (OSError, ValueError) as e:
-            messagebox.showerror("Can't save file", str(e))
+            _open_with_default_app(path)
+        except OSError as e:
+            messagebox.showerror("Can't open file", str(e))
+
+    # ---------- file transfers ----------
+
+    def _update_transfer(self, ev):
+        file_id = ev["file_id"]
+        if file_id in self._finished_transfers:
+            return  # a last progress event can arrive just after the transfer failed
+        row = self.transfer_rows.get(file_id)
+        if row is None:
+            row = self._add_transfer_row(file_id, ev)
+        size = ev.get("size", 0)
+        done = ev.get("done", 0)
+        row["bar"].configure(value=100 * done / size if size else 100)
+        if ev.get("direction") == "send":
+            verb = f"Sending to {ev.get('requester')}:"
+        else:
+            verb = "Downloading"
+        row["label"].configure(text=f"{verb} {ev.get('filename')}  "
+                                    f"{_human_size(done)} / {_human_size(size)}")
+
+    def _add_transfer_row(self, file_id, ev):
+        if not self.transfer_rows:
+            self.transfer_panel.pack(fill="x", padx=16, pady=(0, 8), before=self.input_bar)
+        frame = tk.Frame(self.transfer_panel, bg=COLORS["panel"])
+        frame.pack(fill="x", pady=2)
+        label = tk.Label(frame, bg=COLORS["panel"], fg=COLORS["muted"], anchor="w",
+                         font=("Segoe UI", 9))
+        label.pack(fill="x")
+        bar = ttk.Progressbar(frame, style="Transfer.Horizontal.TProgressbar", maximum=100)
+        bar.pack(fill="x")
+        row = {"frame": frame, "label": label, "bar": bar}
+        self.transfer_rows[file_id] = row
+        return row
+
+    def _finish_transfer(self, ev):
+        """Remove the progress row and report the result in the right conversation."""
+        file_id = ev["file_id"]
+        self._finished_transfers.add(file_id)
+        row = self.transfer_rows.pop(file_id, None)
+        if row:
+            row["frame"].destroy()
+        if not self.transfer_rows:
+            self.transfer_panel.pack_forget()
+
+        sending = ev.get("direction") == "send"
+        name = ev.get("filename", "file")
+        key = ev.get("to", "") if sending else self._conversation_key(ev)
+        size = _human_size(ev.get("size", 0))
+
+        if not sending:
+            failed = ev["type"] == "_file_failed"
+            self._set_card_state(ev.get("offer_id"), "failed" if failed else "saved", ev.get("path"))
+
+        if ev["type"] == "_file_failed":
+            if "verified" in ev:
+                text = f"Received {name} ({size}) from {ev.get('sender')}: {ev.get('reason')}"
+            else:
+                text = f"Transfer of {name} failed: {ev.get('reason')}"
+            self._add_to_conversation(key, {"type": "system", "text": text, "error": True})
             return
-        self.system_message(f"Saved {os.path.basename(path)}")
+
+        took = f"{ev.get('seconds', 0):.1f} s"
+        if sending:
+            text = f"Sent {name} ({size}) to {ev.get('requester')} in {took}"
+        else:
+            text = (f"Received {name} ({size}) from {ev.get('sender')} in {took}\n"
+                    f"Integrity check passed. Saved to {ev.get('path')}")
+        self._add_to_conversation(key, {"type": "system", "text": text})
+
+
+def _file_icon(name):
+    ext = os.path.splitext(name)[1].lower()
+    for icon, extensions in FILE_ICONS.items():
+        if ext in extensions:
+            return icon
+    return "📄"
+
+
+def _open_with_default_app(path):
+    if sys.platform == "win32":
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
 
 
 def _human_size(n):
