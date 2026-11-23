@@ -7,7 +7,7 @@ from enum import Enum
 
 # Server IP and Port configuration
 HOST = '127.0.0.1'  # Server IP (localhost)
-PORT = 65432        # Port for client connections
+PORT = 5000        # Port for client connections
 
 RECV_SIZE = 65536                     # bytes per recv(); one message may span many
 MAX_LINE_BYTES = 256 * 1024           # longest message allowed; a 64 KB chunk is ~88 KB as base64
